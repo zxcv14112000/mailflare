@@ -1,0 +1,486 @@
+import { and, eq, isNotNull } from "drizzle-orm";
+import { getDb } from "@/db";
+import { conversationNotes, mailboxes, messages, outboundJobs } from "@/db/schema";
+import { newId } from "@/lib/ids";
+import { buildSnippet } from "@/lib/email/parse";
+import { dispatchWebhooks } from "@/lib/email/webhooks";
+import { upsertContactsFromAddresses } from "@/lib/contacts/service";
+import { getAuthorizedSenderAddress } from "@/lib/email/sender";
+import { getEmailAddress, getEmailAddressList, joinEmailAddressList, splitEmailAddressList } from "@/lib/email/address";
+import { formatMessageIdHeader, normalizeMessageId, parseMessageIdList } from "@/lib/email/threading";
+import { createAuditLog } from "@/lib/mailboxes/audit";
+import { loadMessageAttachmentContents, storeMessageAttachments, validateAttachments } from "@/lib/email/attachments";
+import type { AttachmentContent } from "@/lib/email/attachment-types";
+import { getOutboundAttachmentMaxMb } from "@/lib/email/attachment-policy";
+import { getOutboundProviderConfig, sendThroughProvider } from "@/lib/email/outbound-provider";
+import { prepareOutboundAttachments } from "@/lib/email/cloud-attachment-utils";
+import { ensureTrackingToken, getTrackingHostForSender } from "@/lib/tracking/open-tracking";
+import { setFollowUp } from "@/lib/follow-ups/service";
+import { buildTrackingPixelUrl, injectTrackingPixel, resolveTrackingOrigin } from "@/lib/tracking/open-tracking-utils";
+import { getComposePreferences } from "@/lib/compose/preferences";
+import { getMailboxDomainAddresses } from "@/lib/mailboxes/domain-addresses";
+import { assertNoSuppressedRecipients, dropSuppressedRecipients } from "@/lib/deliverability/suppression";
+
+export type SendEmailInput = {
+	userId: string;
+	from: string;
+	/** One header-style list or an array; each entry may carry a display name. */
+	to: string | string[];
+	cc?: string | string[];
+	bcc?: string | string[];
+	subject: string;
+	html?: string;
+	text?: string;
+	headers?: Record<string, string>;
+	/** Message-ID of the message being replied to, with or without angle brackets. */
+	inReplyTo?: string | null;
+	/** References chain, as a header string or a list of Message-IDs. */
+	references?: string | string[] | null;
+	/** Conversation to file the sent copy under; defaults to its own Message-ID. */
+	threadId?: string | null;
+	mailboxId: string;
+	attachments?: AttachmentContent[];
+	/** The sender's interface language, for text Mailflare adds to the message (such as the large-file note). */
+	locale?: string;
+	/** Future delivery time. Values at or before the current time send immediately. */
+	scheduledAt?: string | Date;
+	/** Hold the send for the user's undo window (via the scheduled queue) so they can cancel it. */
+	undoSend?: boolean;
+	/** Add a read-receipt pixel to the HTML part (the stored Sent copy stays without it). */
+	trackOpens?: boolean;
+	/** Bring the thread back to the inbox after this many days unless a reply arrives. */
+	followUpDays?: number;
+	publicOrigin?: string;
+};
+
+/** How long a send started from the composer waits before it is delivered. */
+const MAX_RECIPIENTS = 50;
+const MAX_QUEUE_DELAY_SECONDS = 24 * 60 * 60;
+
+type PreparedDelivery = {
+	input: SendEmailInput;
+	messageId: string;
+	jobId: string;
+	from: string;
+	mailboxId: string;
+	to: string[];
+	cc: string[];
+	bcc: string[];
+	headers: Record<string, string>;
+	attachments: AttachmentContent[];
+};
+
+function toRecipientList(value: string | string[] | undefined): string[] {
+	const entries = Array.isArray(value) ? value : splitEmailAddressList(value);
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const entry of entries) {
+		const [address] = getEmailAddressList(entry);
+		if (!address || seen.has(address)) continue;
+		seen.add(address);
+		result.push(entry.trim());
+	}
+	return result;
+}
+
+export async function sendEmail(
+	env: CloudflareEnv,
+	input: SendEmailInput,
+): Promise<{ messageId: string; scheduled?: boolean; undoSeconds?: number; undoRemainingMs?: number; scheduledAt?: string }> {
+	const db = getDb(env);
+	const sender = await getAuthorizedSenderAddress(env, input);
+	const attachments = input.attachments ?? [];
+	const maxAttachmentMb = await getOutboundAttachmentMaxMb(env);
+	validateAttachments(attachments, maxAttachmentMb);
+	if (input.subject.length > 998) throw new Error("Subject exceeds Cloudflare's 998-character limit");
+
+	const to = toRecipientList(input.to);
+	const cc = toRecipientList(input.cc);
+	const bcc = toRecipientList(input.bcc);
+	if (to.length === 0) throw new Error("At least one recipient is required");
+	if (to.length + cc.length + bcc.length > MAX_RECIPIENTS) {
+		throw new Error(`A message can have at most ${MAX_RECIPIENTS} recipients`);
+	}
+	// Before anything is stored: a refused send leaves no draft, contact or job behind.
+	await assertNoSuppressedRecipients(env, sender.fromAddr, [...to, ...cc, ...bcc]);
+	await upsertContactsFromAddresses(env, input.userId, [...to, ...cc, ...bcc], "outbound");
+
+	const inReplyTo = normalizeMessageId(input.inReplyTo);
+	const references = Array.isArray(input.references)
+		? input.references.map((id) => normalizeMessageId(id)).filter((id): id is string => !!id)
+		: parseMessageIdList(input.references);
+	const headers: Record<string, string> = { ...input.headers };
+	if (inReplyTo) headers["In-Reply-To"] = `<${inReplyTo}>`;
+	if (references.length > 0) headers.References = formatMessageIdHeader(references);
+	if (new TextEncoder().encode(Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join("")).byteLength > 16 * 1024) {
+		throw new Error("Headers exceed Cloudflare's 16 KB limit");
+	}
+
+	const messageId = newId("msg");
+	const requestedSchedule = input.scheduledAt ? new Date(input.scheduledAt) : null;
+	const userScheduledAt = requestedSchedule && requestedSchedule.getTime() > Date.now()
+		? requestedSchedule
+		: null;
+	// An explicit schedule wins; otherwise an undoable send waits out the user's undo window.
+	const undoSeconds = !userScheduledAt && input.undoSend ? (await getComposePreferences(env, input.userId)).undoSendSeconds : 0;
+	const scheduledAt = userScheduledAt ?? (undoSeconds > 0 ? new Date(Date.now() + undoSeconds * 1000) : null);
+	const snippet = buildSnippet(input.text ?? null, input.html ?? null);
+	const toAddr = joinEmailAddressList(to);
+
+	await db.insert(messages).values({
+		id: messageId,
+		userId: input.userId,
+		mailboxId: sender.mailboxId,
+		direction: "outbound",
+		fromAddr: sender.fromAddr,
+		toAddr,
+		ccAddr: cc.length ? joinEmailAddressList(cc) : null,
+		bccAddr: bcc.length ? joinEmailAddressList(bcc) : null,
+		subject: input.subject,
+		snippet,
+		textBody: input.text ?? null,
+		htmlBody: input.html ?? null,
+		status: "queued",
+		read: true,
+		threadId: input.threadId ?? null,
+		inReplyTo,
+		references: references.length ? references.join(" ") : null,
+	});
+	try {
+		const stored = await storeMessageAttachments(env, messageId, attachments, { validate: false });
+		stored.forEach((attachment, index) => { attachments[index].storageId = attachment.id; });
+	} catch (error) {
+		await db.delete(messages).where(eq(messages.id, messageId));
+		throw error;
+	}
+
+	const jobId = newId("job");
+	await db.insert(outboundJobs).values({
+		id: jobId,
+		userId: input.userId,
+		messageId,
+		status: "queued",
+		payload: JSON.stringify({
+			...input,
+			from: sender.fromAddr,
+			to,
+			cc,
+			bcc,
+			mailboxId: sender.mailboxId,
+			attachments: attachments.map(({ content: _content, ...attachment }) => attachment),
+		}),
+		scheduledAt,
+	});
+
+	const delivery: PreparedDelivery = {
+		input: { ...input, attachments: undefined },
+		messageId,
+		jobId,
+		from: sender.fromAddr,
+		mailboxId: sender.mailboxId,
+		to,
+		cc,
+		bcc,
+		headers,
+		attachments,
+	};
+	if (scheduledAt) {
+		await enqueueScheduledDelivery(env, delivery, scheduledAt);
+		if (userScheduledAt) {
+			return { messageId, scheduled: true, scheduledAt: scheduledAt.toISOString() };
+		}
+		// Send the window as a duration: client and server clocks need not agree.
+		return {
+			messageId,
+			scheduled: true,
+			undoSeconds,
+			undoRemainingMs: Math.max(0, scheduledAt.getTime() - Date.now()),
+		};
+	}
+
+	await deliverEmail(env, delivery);
+	return { messageId };
+}
+
+async function deliverEmail(env: CloudflareEnv, delivery: PreparedDelivery): Promise<void> {
+	const { input, messageId, jobId, from, mailboxId, headers, attachments } = delivery;
+	const db = getDb(env);
+	let { to, cc, bcc } = delivery;
+	let accepted = false;
+	try {
+		// The sender address was validated at queue time; recheck that the mailbox
+		// still owns it before delivery so a disabled or deleted alias — or a
+		// use-all-domains change — cannot still send from it.
+		const [mailbox] = await db
+			.select({
+				id: mailboxes.id,
+				domainId: mailboxes.domainId,
+				localPart: mailboxes.localPart,
+				useAllDomains: mailboxes.useAllDomains,
+				disabled: mailboxes.disabled,
+			})
+			.from(mailboxes)
+			.where(eq(mailboxes.id, mailboxId))
+			.limit(1);
+		const fromAddress = getEmailAddress(from).toLowerCase();
+		if (!mailbox || mailbox.disabled || !(await getMailboxDomainAddresses(db, mailbox)).includes(fromAddress)) {
+			throw new Error("The sender address is no longer available for this mailbox");
+		}
+		// Queued sends can outlive the check in sendEmail: an address may have bounced since.
+		const kept = await dropSuppressedRecipients(env, from, { to, cc, bcc });
+		if (kept.dropped.length) {
+			({ to, cc, bcc } = kept);
+			await createAuditLog(env, {
+				actorUserId: input.userId,
+				mailboxId,
+				messageId,
+				action: "email.suppressed_recipients_dropped",
+				metadata: { dropped: kept.dropped.join(", ") },
+			});
+			if (to.length === 0) throw new Error("All recipients are on the suppression list");
+		}
+		const toAddr = joinEmailAddressList(to);
+		const provider = await getOutboundProviderConfig(env, from);
+		// Files the provider cannot carry (Cloudflare's 5 MiB cap, or past 25 MB on Resend/SES)
+		// go out as download links; the admin's outgoing limit still applies.
+		const prepared = await prepareOutboundAttachments(env, provider.provider, attachments, {
+			subject: input.subject,
+			html: input.html,
+			text: input.text,
+			headers,
+			publicOrigin: input.publicOrigin,
+			locale: input.locale,
+		});
+		if (prepared.text !== input.text || prepared.html !== input.html) {
+			await db.update(messages).set({ textBody: prepared.text ?? null, htmlBody: prepared.html ?? null }).where(eq(messages.id, messageId));
+		}
+		const html = input.trackOpens && prepared.html ? await withTrackingPixel(env, messageId, from, prepared.html, input.publicOrigin) : prepared.html;
+		const response = await sendThroughProvider(
+			env,
+			provider,
+			{
+				from,
+				to,
+				cc,
+				bcc,
+				subject: input.subject,
+				headers,
+				html,
+				text: prepared.text,
+				attachments: prepared.attachments.map((attachment) => ({
+					filename: attachment.filename,
+					type: attachment.type,
+					content: attachment.content,
+					disposition: attachment.disposition === "inline" && attachment.contentId ? "inline" : "attachment",
+					contentId: attachment.contentId,
+				})),
+			},
+			jobId,
+		);
+		accepted = true;
+
+		// A fresh message starts its own conversation; Cloudflare's Message-ID is what
+		// any reply will name in In-Reply-To, so key the thread by it.
+		const threadId = input.threadId ?? normalizeMessageId(response.messageId) ?? messageId;
+		await db
+			.update(messages)
+			.set({
+				status: "sent",
+				providerMessageId: response.messageId,
+				threadId,
+			})
+			.where(eq(messages.id, messageId));
+		// Notes taken while the message waited in the queue keyed its conversation by
+		// the message id; move them onto the thread key the send just established.
+		if (threadId !== messageId) {
+			await db
+				.update(conversationNotes)
+				.set({ threadKey: threadId })
+				.where(and(eq(conversationNotes.mailboxId, mailboxId), eq(conversationNotes.threadKey, messageId)));
+		}
+		await db.update(outboundJobs).set({ status: "sent", updatedAt: new Date() }).where(eq(outboundJobs.id, jobId));
+		if (input.followUpDays) {
+			// The message is already out; a reminder that cannot be stored must not fail the send.
+			await setFollowUp(env, { messageId, userId: input.userId, days: input.followUpDays }).catch((error) => console.error("Follow-up reminder skipped", error));
+		}
+
+		await dispatchWebhooks(env, input.userId, "message.outbound", {
+			messageId,
+			providerMessageId: response.messageId,
+			to: toAddr,
+			cc: cc.length ? joinEmailAddressList(cc) : undefined,
+		});
+		await createAuditLog(env, {
+			actorUserId: input.userId,
+			mailboxId,
+			messageId,
+			action: "email.send",
+			metadata: { to: toAddr, cc: cc.length ? joinEmailAddressList(cc) : undefined, subject: input.subject },
+		});
+	} catch (err) {
+		if (accepted) {
+			// The provider already took the message. A late bookkeeping error must not mark it failed or
+			// make the caller retry (a queue or JMAP retry would send it twice), so it is only logged.
+			console.error("Post-send bookkeeping failed", err);
+			return;
+		}
+		const error = err instanceof Error ? err.message : "Send failed";
+		await db.update(messages).set({ status: "failed" }).where(eq(messages.id, messageId));
+		await db
+			.update(outboundJobs)
+			.set({ status: "failed", error, updatedAt: new Date() })
+			.where(eq(outboundJobs.id, jobId));
+		await dispatchWebhooks(env, input.userId, "message.failed", { messageId, error });
+		throw err;
+	}
+}
+
+/**
+ * The sender domain's own pixel host wins over APP_URL so the pixel matches the From domain.
+ * A missing origin or an unapplied migration sends the message untracked rather than failing it.
+ */
+async function withTrackingPixel(env: CloudflareEnv, messageId: string, from: string, html: string, publicOrigin: string | undefined): Promise<string> {
+	try {
+		const host = await getTrackingHostForSender(env, from);
+		const origin = host ? `https://${host}` : resolveTrackingOrigin(env.APP_URL, publicOrigin);
+		if (!origin) return html;
+		const token = await ensureTrackingToken(env, messageId);
+		return injectTrackingPixel(html, buildTrackingPixelUrl(origin, token));
+	} catch (error) {
+		console.error("Read receipt skipped", error);
+		return html;
+	}
+}
+
+export type OutboundQueueMessage = {
+	kind: "email.scheduled";
+	jobId: string;
+	messageId: string;
+	scheduledAt: string;
+};
+
+/** Wakes the outbound queue when a job is due; runs again at the delay cap for later times. */
+export async function enqueueOutboundJob(
+	env: CloudflareEnv,
+	jobId: string,
+	messageId: string,
+	scheduledAt: Date,
+): Promise<void> {
+	const delaySeconds = Math.min(
+		MAX_QUEUE_DELAY_SECONDS,
+		Math.max(1, Math.ceil((scheduledAt.getTime() - Date.now()) / 1000)),
+	);
+	await env.OUTBOUND_QUEUE.send(
+		{
+			kind: "email.scheduled",
+			jobId,
+			messageId,
+			scheduledAt: scheduledAt.toISOString(),
+		},
+		{ delaySeconds },
+	);
+}
+
+async function enqueueScheduledDelivery(
+	env: CloudflareEnv,
+	delivery: PreparedDelivery,
+	scheduledAt: Date,
+): Promise<void> {
+	await enqueueOutboundJob(env, delivery.jobId, delivery.messageId, scheduledAt);
+}
+
+function deliveryFromJob(jobId: string, messageId: string, payload: string): PreparedDelivery {
+	const input = JSON.parse(payload) as SendEmailInput;
+	const to = toRecipientList(input.to);
+	const cc = toRecipientList(input.cc);
+	const bcc = toRecipientList(input.bcc);
+	const inReplyTo = normalizeMessageId(input.inReplyTo);
+	const references = Array.isArray(input.references)
+		? input.references.map((id) => normalizeMessageId(id)).filter((id): id is string => !!id)
+		: parseMessageIdList(input.references);
+	const headers: Record<string, string> = { ...input.headers };
+	if (inReplyTo) headers["In-Reply-To"] = `<${inReplyTo}>`;
+	if (references.length > 0) headers.References = formatMessageIdHeader(references);
+	return {
+		input,
+		messageId,
+		jobId,
+		from: input.from,
+		mailboxId: input.mailboxId,
+		to,
+		cc,
+		bcc,
+		headers,
+		attachments: [],
+	};
+}
+
+/** With `dueAt`, the claim also requires the job to still hold that send time, so a
+ * reschedule that lands after the due check cannot be overtaken by the old time. */
+function claimJob(db: ReturnType<typeof getDb>, jobId: string, dueAt?: Date | null) {
+	return db
+		.update(outboundJobs)
+		.set({ status: "sending", updatedAt: new Date() })
+		.where(and(
+			eq(outboundJobs.id, jobId),
+			eq(outboundJobs.status, "queued"),
+			...(dueAt ? [eq(outboundJobs.scheduledAt, dueAt)] : []),
+		))
+		.returning({ id: outboundJobs.id });
+}
+
+/**
+ * Sends a scheduled message before its due time. The job is claimed the same way
+ * the queue consumer claims it, so send-now and the queued delivery cannot both send.
+ * Returns false when the message has already left the queue.
+ */
+export async function sendScheduledMessageNow(env: CloudflareEnv, messageId: string): Promise<boolean> {
+	const db = getDb(env);
+	const [job] = await db
+		.select({ id: outboundJobs.id, payload: outboundJobs.payload })
+		.from(outboundJobs)
+		.where(and(eq(outboundJobs.messageId, messageId), eq(outboundJobs.status, "queued"), isNotNull(outboundJobs.scheduledAt)))
+		.limit(1);
+	if (!job) return false;
+	const delivery = deliveryFromJob(job.id, messageId, job.payload);
+	// Load first: a failure here must leave the job queued so the scheduled send can retry.
+	delivery.attachments = await loadMessageAttachmentContents(env, messageId);
+	const claimed = await claimJob(db, job.id);
+	if (!claimed.length) return false;
+	await deliverEmail(env, delivery);
+	return true;
+}
+
+export async function processOutboundQueue(
+	env: CloudflareEnv,
+	payload: OutboundQueueMessage,
+): Promise<void> {
+	const db = getDb(env);
+	const [job] = await db
+		.select({ status: outboundJobs.status, payload: outboundJobs.payload, scheduledAt: outboundJobs.scheduledAt })
+		.from(outboundJobs)
+		.where(eq(outboundJobs.id, payload.jobId))
+		.limit(1);
+	if (!job || job.status !== "queued") return;
+	// The job row is authoritative: rescheduling edits it while queued messages
+	// already in flight still carry the old time.
+	const scheduledAt = job.scheduledAt ?? new Date(payload.scheduledAt);
+	const delivery = deliveryFromJob(payload.jobId, payload.messageId, job.payload);
+	if (scheduledAt.getTime() > Date.now()) {
+		await enqueueScheduledDelivery(env, delivery, scheduledAt);
+		return;
+	}
+	// Load first: a failure here must leave the job queued so the queue retry can send it.
+	delivery.attachments = await loadMessageAttachmentContents(env, payload.messageId);
+	// Claim the job before delivering. Cancelling deletes only a job that is still
+	// "queued", so exactly one of cancel and delivery wins.
+	const claimed = await claimJob(db, payload.jobId, job.scheduledAt);
+	if (!claimed.length) {
+		// Lost to a cancel or another consumer, or the send time moved after we
+		// read it. In the last case the job is still queued: look again.
+		const [current] = await db.select({ status: outboundJobs.status }).from(outboundJobs).where(eq(outboundJobs.id, payload.jobId)).limit(1);
+		if (current?.status === "queued") await processOutboundQueue(env, payload);
+		return;
+	}
+	await deliverEmail(env, delivery);
+}

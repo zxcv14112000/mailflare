@@ -1,0 +1,854 @@
+"use client";
+
+import Link from "next/link";
+import { confirmDestructive, alertDialog } from "@/components/ui/confirm-dialog";
+import { useRouter } from "next/navigation";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent } from "react";
+import { Archive, ChevronLeft, ChevronRight, ListFilter, Mail, MailOpen, Trash2 } from "@/components/icons";
+import { useLanguage } from "@/components/language-provider";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Tooltip } from "@/components/ui/tooltip";
+import { useMailSearch } from "@/components/mail-search/mail-search-context";
+import { useSelectedMailbox } from "@/components/mailbox-provider";
+import { usePageLoading } from "@/components/page-loading";
+import { formatScheduledSendTime } from "./scheduled-send-utils";
+import { useHasHover, useIsDesktop, useIsMobile } from "@/components/sidebar-mobile-utils";
+import { useMessageCounts } from "@/hooks/use-message-counts";
+import { useMessages } from "@/hooks/use-messages";
+import type { BulkMessageAction } from "@/app/api/messages/bulk/types";
+import type { Message } from "@/hooks/types";
+import { setMessageDragData } from "@/lib/messages/drag-utils";
+import { BulkMessageToolbar } from "./bulk-message-toolbar";
+import { MessageListRefreshButton } from "./message-list-refresh-button";
+import { useMessageListState } from "./message-list-state";
+import { getEmptyPageOffset } from "./page-offset";
+import { SwipeableRow } from "./swipeable-row";
+import { MessageListRowActions } from "./message-list-row-actions";
+import { dispatchMessageCountsDelta, toggleMessageStar } from "./message-list-row-actions-utils";
+import { useMessageNavigation } from "./message-navigation";
+import { rememberOpenedUnreadMessage } from "./message-detail-navigation-utils";
+import { useConversationView } from "./use-conversation-view";
+import { OpenedIndicator } from "./message-open-status";
+import { MessageNotesPopover, NoteBadge } from "./message-notes-popover";
+import type { MessageFolderConfig, MessageFolderPageProps, MessageListRowProps, RowMessageAction } from "./types";
+import {
+	formatMessageListTimestamp,
+	getPageRange,
+	getMessageParty,
+	getMessagePartyClassName,
+	getMessagePreview,
+	getUnreadFlipCount,
+	isMessageListRowUnread,
+	formatEmailPageTitle,
+	getMailboxAddress,
+	runBulkMessageAction,
+	emptyMessageFolder,
+} from "./utils";
+import {
+	getEmptyFolderConfirmText,
+	getEmptyFolderLabel,
+	getPermanentDeleteFolderLabel,
+	getPermanentDeleteConfirmText,
+	PartialDeleteError,
+	supportsPermanentDelete,
+} from "@/lib/messages/permanent-delete-utils";
+import clsx from "clsx";
+import { DueFollowUps } from "@/components/follow-ups/due-follow-ups";
+import { getUserTimeZone, zonedDateFields } from "@/lib/time/utils";
+import { moveMessagesToCategory } from "@/lib/promotions/move-client";
+import { canMoveCategory, moveTargetFor, showsPromotionChip } from "@/lib/promotions/move-utils";
+import { hasActivePromotions, mergeUnreadDeltas, negateUnreadDeltas, unreadDeltas, type UnreadDeltas } from "@/lib/promotions/ui-utils";
+
+const pageSize = 25;
+
+function supportsRowActions(folder: MessageFolderConfig["folder"]): boolean {
+	return folder === "inbox" || folder === "promotions" || folder === "snoozed" || folder === "archived" || folder === "spam" || folder === "trash";
+}
+
+/** Whether the action takes the row out of the folder that is on screen. */
+function removesMessageFromFolder(config: MessageFolderConfig, action: RowMessageAction): boolean {
+	if (action === "archive" || action === "trash") return true;
+	if (action === "inbox") {
+		return config.folder === "archived" || config.folder === "spam" || config.folder === "trash" || !!config.folderId;
+	}
+	if (action === "delete") return config.folder === "trash" || config.folder === "spam";
+	return false;
+}
+
+function getRowMessageIds(message: Message): string[] {
+	return message.threadMessageIds ?? [message.id];
+}
+
+/** Whether the browser is still showing this message in this folder's reader. */
+function isCurrentMessageRoute(hrefPrefix: string, messageId: string): boolean {
+	if (typeof window === "undefined") return false;
+	const pathname = window.location.pathname.replace(/\/+$/, "");
+	const prefix = hrefPrefix.replace(/\/+$/, "");
+	return pathname === `${prefix}/${encodeURIComponent(messageId)}`;
+}
+
+let todayCacheZone = "";
+let todayCacheValue = "";
+let todayCacheExpiresAt = 0;
+
+function getTodayKey(): string {
+	const zone = getUserTimeZone();
+	const now = Date.now();
+	if (todayCacheZone !== zone || now >= todayCacheExpiresAt) {
+		todayCacheZone = zone;
+		todayCacheExpiresAt = now + 60_000;
+		todayCacheValue = zonedDateFields(new Date(now), zone).toISOString().slice(0, 10);
+	}
+	return todayCacheValue;
+}
+
+function MessageListRowComponent({
+	message,
+	config,
+	selected,
+	active = false,
+	opening = false,
+	compact = false,
+	currentAccountName,
+	onSelectedChange,
+	onMessageAction,
+	onOpening,
+	onSnoozeChange,
+	showCompactRowActions = false,
+	dragMessageIds,
+	todayKey,
+	promotionMode,
+	canMovePromotions = false,
+}: MessageListRowProps) {
+	const { t } = useLanguage();
+	const Icon = config.icon;
+	const [read, setRead] = useState(message.read);
+	const [threadUnread, setThreadUnread] = useState(message.threadUnread);
+	const [starred, setStarred] = useState(message.starred);
+	// Follow server updates to each flag independently, keeping local optimistic values otherwise.
+	const [prevFlags, setPrevFlags] = useState({ read: message.read, threadUnread: message.threadUnread, starred: message.starred });
+	if (message.read !== prevFlags.read || message.threadUnread !== prevFlags.threadUnread || message.starred !== prevFlags.starred) {
+		setPrevFlags({ read: message.read, threadUnread: message.threadUnread, starred: message.starred });
+		if (message.read !== prevFlags.read) setRead(message.read);
+		if (message.threadUnread !== prevFlags.threadUnread) setThreadUnread(message.threadUnread);
+		if (message.starred !== prevFlags.starred) setStarred(message.starred);
+	}
+	const rowMessage = useMemo(
+		() => ({ ...message, read, starred, threadUnread }),
+		[message, read, starred, threadUnread],
+	);
+	const unread = isMessageListRowUnread(rowMessage);
+	const draggable = config.folder === "inbox" && message.direction === "inbound";
+	const party = getMessageParty(rowMessage, config.folder, currentAccountName, t);
+	const preview = getMessagePreview(rowMessage, config.folder, t);
+	const href = `${config.hrefPrefix}/${message.id}`;
+	const navigation = useMessageNavigation(href, rowMessage);
+
+	// Which folder counts a read flip on this row moves; see unreadDeltas.
+	const rowDeltas = useCallback((flip: number) => unreadDeltas({ folder: config.folder, folderId: config.folderId, mode: promotionMode, category: message.category }, flip), [config.folder, config.folderId, promotionMode, message.category]);
+
+	const runRowAction = useCallback(async (action: RowMessageAction) => {
+		const previousRead = read;
+		const previousThreadUnread = threadUnread;
+		const unreadDelta = action !== "read" && action !== "unread"
+			? null
+			: rowDeltas(getUnreadFlipCount(rowMessage, action === "read") * (action === "read" ? -1 : 1));
+		if (action === "read") setRead(true);
+		if (action === "unread") setRead(false);
+		// Grouped rows derive their unread styling from the thread count, so it must change with the row.
+		if (message.threadMessageIds) {
+			if (action === "read") setThreadUnread(0);
+			if (action === "unread") setThreadUnread(message.threadMessageIds.length);
+		}
+		if (unreadDelta) dispatchMessageCountsDelta(unreadDelta);
+		try {
+			await onMessageAction(message.id, action);
+		} catch (error) {
+			if (action === "read" || action === "unread") {
+				setRead(previousRead);
+				setThreadUnread(previousThreadUnread);
+				if (unreadDelta) dispatchMessageCountsDelta(negateUnreadDeltas(unreadDelta)!);
+			}
+			throw error;
+		}
+	}, [message.id, message.threadMessageIds, onMessageAction, read, rowDeltas, rowMessage, threadUnread]);
+
+	const promotionTarget = canMovePromotions ? moveTargetFor(message.category) : undefined;
+	const moveToCategory = useCallback(() => {
+		if (!promotionTarget) return;
+		void moveMessagesToCategory({ messageIds: getRowMessageIds(message), target: promotionTarget, mailboxId: message.mailboxId, senderAddress: message.senderAddress });
+	}, [message, promotionTarget]);
+	const promotionChip = showsPromotionChip({ folder: config.folder, folderId: config.folderId, mode: promotionMode, category: message.category })
+		? <span className="ms-2 inline-flex shrink-0 items-center rounded-md bg-amber-50 px-1.5 text-[11px] font-medium leading-5 text-amber-800 ring-1 ring-inset ring-amber-200">{t("promotions.chip")}</span>
+		: null;
+
+	const swipeable = compact && (config.folder === "inbox" || config.folder === "snoozed") && message.direction === "inbound";
+
+	function onMessageNavigate(event: MouseEvent<HTMLAnchorElement>) {
+		const plainClick = !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+		if (plainClick) onOpening?.(message.id);
+		if (!read && plainClick) {
+			rememberOpenedUnreadMessage(message.id);
+			const previousThreadUnread = threadUnread;
+			setRead(true);
+			if (previousThreadUnread !== undefined) setThreadUnread(Math.max(0, previousThreadUnread - 1));
+			const openDelta = message.direction === "inbound" ? rowDeltas(-1) : null;
+			if (openDelta) dispatchMessageCountsDelta(openDelta);
+			void runBulkMessageAction([message.id], "read", false, undefined, { undo: false }).catch(() => {
+				setRead(false);
+				setThreadUnread(previousThreadUnread);
+				if (openDelta) dispatchMessageCountsDelta(negateUnreadDeltas(openDelta)!);
+			});
+		}
+		navigation.onNavigate(event, !read);
+	}
+
+	if (compact) {
+		const compactRow = (
+			<div
+				role={swipeable ? undefined : "listitem"}
+				className={`group relative grid grid-cols-[20px_minmax(0,1fr)] gap-3 border-l-2 px-4 py-3 transition-colors ${active || opening
+					? "border-l-blue-600 bg-blue-50"
+					: selected
+						? "border-l-transparent bg-neutral-50"
+						: "border-l-transparent hover:bg-neutral-50 focus-within:bg-neutral-50"
+					} ${draggable ? "cursor-grab active:cursor-grabbing" : ""}`}
+				draggable={draggable}
+				onDragStart={(event) => {
+					if (!draggable) return;
+					setMessageDragData(event.dataTransfer, { messageIds: dragMessageIds ?? message.threadMessageIds ?? [message.id] });
+				}}
+			>
+				<Checkbox
+					checked={selected}
+					onChange={(event) => onSelectedChange(message.id, event.target.checked)}
+					className="mt-1 h-4 w-4 rounded border-neutral-300"
+					aria-label={t("list.selectFrom", { sender: party })}
+				/>
+				<Link
+					href={href}
+					onClick={config.folder === "drafts" ? undefined : onMessageNavigate}
+					onPointerEnter={config.folder === "drafts" ? undefined : navigation.prefetch}
+					onPointerLeave={config.folder === "drafts" ? undefined : navigation.cancelPrefetch}
+					onFocus={config.folder === "drafts" ? undefined : navigation.prefetch}
+					onBlur={config.folder === "drafts" ? undefined : navigation.cancelPrefetch}
+					onTouchStart={config.folder === "drafts" ? undefined : navigation.prefetchNow}
+					aria-current={active ? "true" : undefined}
+					className="min-w-0"
+				>
+					<span className="flex items-baseline justify-between gap-3">
+						<span className={clsx(unread && "font-semibold",getMessagePartyClassName(rowMessage, config.folder))}>
+							{unread && <span className="sr-only">{t("list.unread")} </span>}
+							{party}
+
+							{(message.threadCount ?? 1) > 1 && (
+								<span className="ml-2 text-xs font-normal text-neutral-500">{message.threadCount}</span>
+							)}
+							<NoteBadge count={message.noteCount} className="ml-2" />
+							{promotionChip}
+						</span>
+						<span className={clsx(unread ?"font-medium":"text-neutral-500","shrink-0 text-[11px]")}>
+							<OpenedIndicator count={message.openCount} />
+							{message.scheduledAt ? formatScheduledSendTime(message.scheduledAt, t) : formatMessageListTimestamp(message.createdAt, todayKey)}
+						</span>
+					</span>
+					<span
+						className={`mt-1 block truncate text-sm ${unread ? "font-semibold text-neutral-900" : "text-neutral-700"
+							}`}
+					>
+						{message.subject ?? t("list.noSubject")}
+					</span>
+					<span className="mt-0.5 block truncate text-xs leading-5 text-neutral-500">
+						{preview}
+					</span>
+				</Link>
+				{showCompactRowActions && supportsRowActions(config.folder) && message.direction === "inbound" && (
+					<MessageListRowActions
+						message={rowMessage}
+						folder={config.folder}
+						folderId={config.folderId}
+						onAction={runRowAction}
+						compact
+						active={active || opening}
+						onSnoozeChange={onSnoozeChange}
+						promotionTarget={promotionTarget}
+						onPromotionMove={moveToCategory}
+					/>
+				)}
+			</div>
+		);
+		if (!swipeable) return compactRow;
+		return (
+			<SwipeableRow
+				role="listitem"
+				startAction={{
+					label: read ? t("list.markUnread") : t("list.markRead"),
+					icon: read ? Mail : MailOpen,
+					className: "bg-blue-600",
+					onTrigger: () => void runRowAction(read ? "unread" : "read").catch(() => undefined),
+				}}
+				endAction={{
+					label: t("common.archive"),
+					icon: Archive,
+					className: "bg-emerald-600",
+					onTrigger: () => void runRowAction("archive").catch(() => undefined),
+				}}
+			>
+				{compactRow}
+			</SwipeableRow>
+		);
+	}
+
+	const className =
+		`group relative grid min-h-12 w-full grid-cols-[24px_32px_minmax(160px,80px)_1fr_auto] items-center gap-3 px-6 text-left text-sm hover:z-10 hover:bg-[#f2f6fc] hover:shadow-sm has-[a:focus-visible]:ring-2 has-[a:focus-visible]:ring-inset has-[a:focus-visible]:ring-blue-600 ${active || selected || opening ? "bg-blue-50" : ""
+		} ${draggable ? "cursor-grab active:cursor-grabbing" : ""}`;
+	const content = (
+		<>
+			{config.folder === "inbox" && message.direction === "inbound" && (
+				<Tooltip label={starred ? t("list.starred") : t("list.notStarred")}>
+					<Button
+						type="button"
+						variant="ghost"
+						size="sm"
+						className="relative z-10"
+						onClick={() => {
+							void toggleMessageStar(message.id, !starred).then((result) => setStarred(result.starred)).catch(() => alertDialog(t("message.error.star")));
+						}}
+						aria-label={t("message.star")}
+						aria-pressed={starred}
+					>
+						<Icon className={`h-4 w-4 ${starred ? "fill-amber-400 text-amber-400" : "text-neutral-300"}`} />
+					</Button>
+				</Tooltip>
+			)}
+			{(config.folder !== "inbox" || message.direction !== "inbound") && (
+				<Icon className="h-4 w-4 text-neutral-300" />
+			)}
+			<span className={clsx(unread && "font-semibold", getMessagePartyClassName(rowMessage, config.folder))}>
+				{unread && <span className="sr-only">{t("list.unread")} </span>}
+				{party}
+
+				{(message.threadCount ?? 1) > 1 && (
+					<span className="ml-2 text-xs text-neutral-500">{message.threadCount}</span>
+				)}
+			</span>
+			<span className="flex min-w-0 items-center text-neutral-700">
+				{/* A fixed slot keeps every subject aligned, with or without notes. */}
+				<span className="w-11 shrink-0">
+					{message.noteCount ? <MessageNotesPopover messageId={message.id} count={message.noteCount} preview={message.notePreview} /> : null}
+				</span>
+				<Link
+					href={href}
+					onClick={config.folder === "drafts" ? undefined : onMessageNavigate}
+					onPointerEnter={config.folder === "drafts" ? undefined : navigation.prefetch}
+					onPointerLeave={config.folder === "drafts" ? undefined : navigation.cancelPrefetch}
+					onFocus={config.folder === "drafts" ? undefined : navigation.prefetch}
+					onBlur={config.folder === "drafts" ? undefined : navigation.cancelPrefetch}
+					onTouchStart={config.folder === "drafts" ? undefined : navigation.prefetchNow}
+					aria-current={active ? "true" : undefined}
+					className="min-w-0 truncate focus-visible:outline-none after:absolute after:inset-0"
+				>
+					<span className={unread ? "font-semibold text-neutral-900" : ""}>
+						{rowMessage.subject ?? t("list.noSubject")}
+					</span>
+					<span className="text-neutral-500"> - {getMessagePreview(rowMessage, config.folder, t)}</span>
+				</Link>
+				{promotionChip}
+			</span>
+			<time
+				dateTime={message.createdAt}
+				className={`min-w-[96px] whitespace-nowrap text-right text-xs group-hover:opacity-0 ${unread ? "font-semibold text-neutral-800" : "text-neutral-500"
+					}`}
+			>
+				<OpenedIndicator count={message.openCount} />
+				{message.scheduledAt ? formatScheduledSendTime(message.scheduledAt, t) : formatMessageListTimestamp(message.createdAt, todayKey)}
+			</time>
+		</>
+	);
+
+	if (config.folder === "drafts") {
+		return (
+			<div role="listitem" className={className}>
+				<Checkbox
+					checked={selected}
+					onChange={(event) => onSelectedChange(message.id, event.target.checked)}
+					className="relative z-10 h-4 w-4 rounded border-neutral-300"
+					aria-label={t("list.selectMessage")}
+				/>
+				{content}
+			</div>
+		);
+	}
+
+	return (
+		<div
+			role="listitem"
+			className={className}
+			draggable={draggable}
+			onDragStart={(event) => {
+				if (!draggable) return;
+				setMessageDragData(event.dataTransfer, { messageIds: dragMessageIds ?? message.threadMessageIds ?? [message.id] });
+			}}
+		>
+			<Checkbox
+				checked={selected}
+				onChange={(event) => onSelectedChange(message.id, event.target.checked)}
+				className="relative z-10 h-4 w-4 rounded border-neutral-300"
+				aria-label={t("list.selectFrom", { sender: party })}
+			/>
+			{content}
+			{supportsRowActions(config.folder) && message.direction === "inbound" && (
+				<MessageListRowActions
+					message={rowMessage}
+					folder={config.folder}
+					folderId={config.folderId}
+					onAction={runRowAction}
+					onSnoozeChange={onSnoozeChange}
+					promotionTarget={promotionTarget}
+					onPromotionMove={moveToCategory}
+				/>
+			)}
+		</div>
+	);
+}
+
+const MessageListRow = memo(MessageListRowComponent);
+
+export function MessageFolderPage({
+	config,
+	compact = false,
+	selectedMessageId,
+}: MessageFolderPageProps) {
+	const { t } = useLanguage();
+	const title = config.titleKey ? t(config.titleKey) : config.title;
+	const { selectedMailbox, isLoading: mailboxesLoading } = useSelectedMailbox();
+	const { query } = useMailSearch();
+	const router = useRouter();
+	const isMobile = useIsMobile();
+	const isDesktop = useIsDesktop();
+	const hasHover = useHasHover();
+	const compactRowActions = compact && isDesktop && hasHover;
+	// Row actions can resolve after the reader has moved. Compare against the
+	// message that is open now, not the one that was open when the request began.
+	const selectedMessageIdRef = useRef(selectedMessageId);
+	const listState = useMessageListState();
+
+	useLayoutEffect(() => {
+		selectedMessageIdRef.current = selectedMessageId;
+	}, [selectedMessageId]);
+	const usesSharedListState = listState !== null;
+	const [internalOffset, setInternalOffset] = useState(0);
+	const [internalSelectedMessages, setInternalSelectedMessages] = useState<
+		Array<{ id: string; read: boolean }>
+	>([]);
+	const [internalUnreadOnly, setInternalUnreadOnly] = useState(false);
+	const [pendingBulkAction, setPendingBulkAction] = useState(false);
+	const [emptyingFolder, setEmptyingFolder] = useState(false);
+	const [actionError, setActionError] = useState<string | null>(null);
+	const [openingMessageId, setOpeningMessageId] = useState<string | null>(null);
+	const openingTimer = useRef<number | null>(null);
+	const [conversationView] = useConversationView();
+	const visibleOpeningMessageId = openingMessageId === selectedMessageId ? null : openingMessageId;
+	const todayKey = getTodayKey();
+
+	useEffect(() => () => {
+		if (openingTimer.current) window.clearTimeout(openingTimer.current);
+	}, []);
+
+	const markMessageOpening = useCallback((messageId: string) => {
+		setOpeningMessageId(messageId);
+		if (openingTimer.current) window.clearTimeout(openingTimer.current);
+		openingTimer.current = window.setTimeout(() => setOpeningMessageId(null), 3000);
+	}, []);
+	const grouped = conversationView && config.folder !== "drafts";
+	const offset = listState?.offset ?? internalOffset;
+	const setOffset = listState?.setOffset ?? setInternalOffset;
+	const selectedMessages = listState?.selectedMessages ?? internalSelectedMessages;
+	const setSelectedMessages = listState?.setSelectedMessages ?? setInternalSelectedMessages;
+	const unreadOnly = listState?.unreadOnly ?? internalUnreadOnly;
+	const setUnreadOnly = listState?.setUnreadOnly ?? setInternalUnreadOnly;
+	const { messages, isLoading, total, limit, updateMessages } = useMessages(config.folder, selectedMailbox?.id, {
+		query,
+		limit: pageSize,
+		offset,
+		read: unreadOnly ? "unread" : "all",
+		group: grouped ? "thread" : undefined,
+	}, !mailboxesLoading, config.folderId);
+	const { counts, isLoading: countsLoading } = useMessageCounts(selectedMailbox?.id, !mailboxesLoading);
+	const { mailboxes: accessibleMailboxes } = useSelectedMailbox();
+	const getPromotionMode = useCallback((message: Message): "show" | "separate" | undefined => counts.promotionModes?.[message.mailboxId ?? ""], [counts.promotionModes]);
+	// Only received mail in Inbox or Promotions moves between them, in mailboxes with Promotions on that the user manages.
+	const canMovePromotions = useCallback((message: Message) => (config.folder === "promotions" || (config.folder === "inbox" && !config.folderId)) && canMoveCategory({
+		mode: counts.promotionModes?.[message.mailboxId ?? ""],
+		permission: accessibleMailboxes.find((mailbox) => mailbox.id === message.mailboxId)?.permission,
+		direction: message.direction,
+		status: message.status,
+	}), [accessibleMailboxes, config.folder, config.folderId, counts.promotionModes]);
+	// Promotions with every mailbox off is empty by design; say so and point at the setting.
+	const promotionsOff = config.folder === "promotions" && !mailboxesLoading && !countsLoading && !hasActivePromotions(counts.promotionModes);
+	usePageLoading(mailboxesLoading || isLoading, true);
+	const headerIcons = config.headerIcons ?? [];
+	const hasActiveFilters = !!query.trim();
+	const folderCount = config.folderId
+		? counts.customFolders[config.folderId]
+		: counts.folders[config.folder];
+	const titleTotal = folderCount?.total ?? total;
+	const titleUnread = folderCount?.unread ?? 0;
+	const mailboxAddress = getMailboxAddress(selectedMailbox);
+	const currentAccountName = selectedMailbox?.displayName ?? selectedMailbox?.localPart;
+	const pageRange = getPageRange(offset, messages.length, total);
+	const selectedIds = useMemo(
+		() => selectedMessages.map((message) => message.id),
+		[selectedMessages],
+	);
+	const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+	const hasUnreadSelection = selectedMessages.some((message) => !message.read);
+	const allVisibleSelected = messages.length > 0 && messages.every((message) => selectedIdSet.has(message.id));
+	// In conversation view a row stands for every message of its thread in this
+	// folder, so actions and drags carry all of them.
+	const expandSelectedIds = useCallback(
+		(ids: string[]) =>
+			ids.flatMap((id) => getRowMessageIds(messages.find((message) => message.id === id) ?? { id } as Message)),
+		[messages],
+	);
+	const selectedDragIds = useMemo(() => expandSelectedIds(selectedIds), [expandSelectedIds, selectedIds]);
+
+	// A split-layout list keeps this state in MessageSplitLayout, which resets
+	// it when the list view changes. Standalone lists (drafts) own it here.
+	useEffect(() => {
+		if (usesSharedListState) return;
+		setOffset(0);
+		setSelectedMessages([]);
+	}, [usesSharedListState, query, selectedMailbox?.id, config.folder, config.folderId, unreadOnly, grouped, setOffset, setSelectedMessages]);
+
+	const previousOffset = useRef(offset);
+	useEffect(() => {
+		if (previousOffset.current === offset) return;
+		previousOffset.current = offset;
+		setSelectedMessages([]);
+	}, [offset, setSelectedMessages]);
+
+	useEffect(() => {
+		const originalTitle = document.title;
+		return () => {
+			document.title = originalTitle;
+		};
+	}, []);
+
+	useEffect(() => {
+		if (mailboxesLoading) return;
+		document.title = formatEmailPageTitle({
+			location: title,
+			inbox: config.folder === "inbox" && !config.folderId,
+			total: titleTotal,
+			unread: titleUnread,
+			emailAddress: mailboxAddress,
+		});
+	}, [title, config.folder, config.folderId, mailboxAddress, mailboxesLoading, titleTotal, titleUnread]);
+
+	useEffect(() => {
+		if (isLoading) return;
+		setSelectedMessages((current) => {
+			const remaining = current.filter((item) => messages.some((message) => message.id === item.id));
+			return remaining.length === current.length ? current : remaining;
+		});
+	}, [messages, isLoading, setSelectedMessages]);
+
+	useEffect(() => {
+		if (isLoading || messages.length > 0) return;
+		const nextOffset = getEmptyPageOffset(offset, total, limit);
+		if (nextOffset === null) return;
+		setOffset(nextOffset);
+	}, [isLoading, offset, messages.length, total, limit, setOffset]);
+
+	const updateSelectedMessage = useCallback((messageId: string, selected: boolean) => {
+		const message = messages.find((item) => item.id === messageId);
+		if (!message) return;
+
+		setSelectedMessages((current) => {
+			if (!selected) return current.filter((item) => item.id !== messageId);
+			if (current.some((item) => item.id === messageId)) return current;
+			return [...current, { id: message.id, read: message.read && !(message.threadUnread ?? 0) }];
+		});
+	}, [messages, setSelectedMessages]);
+
+	const handleMessageAction = useCallback((messageId: string, action: RowMessageAction) => {
+		setActionError(null);
+		const affectedIds = expandSelectedIds([messageId]);
+		return runBulkMessageAction(affectedIds, action, action !== "read" && action !== "unread").then(() => {
+			const currentSelectedMessageId = selectedMessageIdRef.current;
+			if (!currentSelectedMessageId || !removesMessageFromFolder(config, action)) return;
+			if (!affectedIds.includes(currentSelectedMessageId)) return;
+			if (isCurrentMessageRoute(config.hrefPrefix, currentSelectedMessageId)) router.push(config.hrefPrefix);
+		}).catch((error) => {
+			setActionError(error instanceof PartialDeleteError ? t("actions.error.deleteSkipped") : t("actions.error.update"));
+			throw error;
+		});
+	}, [config, expandSelectedIds, router, t]);
+
+	const handleSnoozeChange = useCallback((messageId: string, snoozed: boolean) => {
+		const currentSelectedMessageId = selectedMessageIdRef.current;
+		if (!currentSelectedMessageId || messageId !== currentSelectedMessageId) return;
+		const removesOpenMessage = snoozed
+			? config.folder === "inbox" && !config.folderId
+			: config.folder === "snoozed";
+		if (removesOpenMessage && isCurrentMessageRoute(config.hrefPrefix, currentSelectedMessageId)) router.push(config.hrefPrefix);
+	}, [config.folder, config.folderId, config.hrefPrefix, router]);
+
+	function toggleAllVisible(selected: boolean) {
+		const visibleIds = new Set(messages.map((message) => message.id));
+		setSelectedMessages((current) => {
+			if (!selected) {
+				return current.filter((message) => !visibleIds.has(message.id));
+			}
+
+			const next = new Map(current.map((message) => [message.id, message]));
+			for (const message of messages) {
+				next.set(message.id, { id: message.id, read: message.read && !(message.threadUnread ?? 0) });
+			}
+			return Array.from(next.values());
+		});
+	}
+
+	const permanentDeleteFolder = !config.folderId && supportsPermanentDelete(config.folder) ? config.folder : null;
+	async function emptyFolder() {
+		if (!permanentDeleteFolder || !selectedMailbox?.id) return;
+		if (!await confirmDestructive(getEmptyFolderConfirmText(permanentDeleteFolder, titleTotal, t))) return;
+		setEmptyingFolder(true);
+		try {
+			await emptyMessageFolder(selectedMailbox.id, permanentDeleteFolder);
+			setOffset(0);
+		} catch (error) {
+			console.error(error);
+			void alertDialog(t("list.emptyFailed", { folder: getPermanentDeleteFolderLabel(permanentDeleteFolder, t) }));
+		} finally {
+			setEmptyingFolder(false);
+		}
+	}
+
+	useEffect(() => {
+		if (!actionError) return;
+		const timer = setTimeout(() => setActionError(null), 6000);
+		return () => clearTimeout(timer);
+	}, [actionError]);
+
+	async function runSelectedActionReportingErrors(action: BulkMessageAction, folderId?: string) {
+		setActionError(null);
+		try {
+			await runSelectedAction(action, folderId);
+		} catch (error) {
+			setActionError(error instanceof PartialDeleteError ? t("actions.error.deleteSkipped") : t("actions.error.update"));
+		}
+	}
+
+	async function runSelectedAction(action: BulkMessageAction, folderId?: string) {
+		if (selectedIds.length === 0) return;
+		if (action === "delete") {
+			const ids = expandSelectedIds(selectedIds);
+			if (!await confirmDestructive(getPermanentDeleteConfirmText(ids.length, t))) return;
+		}
+
+		setPendingBulkAction(true);
+		const previousReadStates = new Map(messages
+			.filter((message) => selectedIdSet.has(message.id))
+			.map((message) => [message.id, { read: message.read, threadUnread: message.threadUnread }]));
+		const previousSelectedRead = new Map(selectedMessages.map((message) => [message.id, message.read]));
+		const readValue = action === "read" ? true : action === "unread" ? false : null;
+		const countsDelta = readValue === null
+			? null
+			: messages
+				.filter((message) => selectedIdSet.has(message.id))
+				.reduce<UnreadDeltas | null>((total, message) => mergeUnreadDeltas(total, unreadDeltas(
+					{ folder: config.folder, folderId: config.folderId, mode: getPromotionMode(message), category: message.category },
+					getUnreadFlipCount(message, readValue) * (readValue ? -1 : 1),
+				)), null);
+		if (readValue !== null) {
+			updateMessages((current) => current.map((message) =>
+				selectedIdSet.has(message.id)
+					? { ...message, read: readValue, ...(message.threadMessageIds ? { threadUnread: readValue ? 0 : message.threadMessageIds.length } : {}) }
+					: message,
+			));
+			setSelectedMessages((current) => current.map((message) => ({ ...message, read: readValue })));
+			if (countsDelta) dispatchMessageCountsDelta(countsDelta);
+		}
+		try {
+			await runBulkMessageAction(expandSelectedIds(selectedIds), action, true, folderId);
+			setSelectedMessages([]);
+		} catch (error) {
+			if (readValue !== null) {
+				// Roll back only the fields this action optimistically changed, and only
+				// on the rows it touched; another action must not be clobbered.
+				updateMessages((current) => current.map((message) => {
+					const previous = previousReadStates.get(message.id);
+					if (!previous) return message;
+					return {
+						...message,
+						read: previous.read,
+						...(message.threadMessageIds ? { threadUnread: previous.threadUnread } : {}),
+					};
+				}));
+				setSelectedMessages((current) => current.map((message) => {
+					const previous = previousSelectedRead.get(message.id);
+					return previous === undefined ? message : { ...message, read: previous };
+				}));
+				if (countsDelta) dispatchMessageCountsDelta(negateUnreadDeltas(countsDelta)!);
+			}
+			throw error;
+		} finally {
+			setPendingBulkAction(false);
+		}
+	}
+
+	const refreshButton = (
+		<MessageListRefreshButton
+			disabled={mailboxesLoading}
+			onError={() => setActionError(t("list.refreshFailed"))}
+		/>
+	);
+
+	return (
+		<div className="flex h-full min-h-0 flex-col">
+			<div className={`flex h-14 shrink-0 items-center justify-between border-b border-neutral-200 ${compact ? "px-4" : "px-4.5 md:px-6"}`}>
+				{selectedMessageId ? <h2 className="sr-only">{title}</h2> : <h1 className="sr-only">{title}</h1>}
+				<div className="flex items-center gap-3 w-full">
+					<Tooltip label={t("list.selectAll")}>
+						<Checkbox
+							checked={allVisibleSelected}
+							disabled={messages.length === 0}
+							onChange={(event) => toggleAllVisible(event.target.checked)}
+							className="h-4 w-4 rounded border-neutral-300"
+							aria-label={t("list.selectAll")}
+						/>
+					</Tooltip>
+					{!compact && refreshButton}
+					{selectedIds.length > 0 && !compact ? (
+						<BulkMessageToolbar
+							selectedCount={selectedIds.length}
+							hasUnreadSelection={hasUnreadSelection}
+							onAction={runSelectedActionReportingErrors}
+							onClearSelection={() => setSelectedMessages([])}
+							pending={pendingBulkAction}
+							folder={config.folderId ? undefined : config.folder}
+						/>
+					) : (
+						(compact || isMobile) && (
+							<p aria-hidden="true" className="truncate font-semibold text-neutral-900 pl-1">{title}</p>
+						)
+					)}
+				</div>
+				{(selectedIds.length === 0 || compact) && (
+					<div className="flex items-center gap-2 text-neutral-500">
+						<span className="text-xs text-neutral-500 whitespace-nowrap">
+							{t("list.range", { start: pageRange.start, end: pageRange.end, total: pageRange.total })}
+						</span>
+						{compact && refreshButton}
+						<Tooltip label={t("list.previousPage")}>
+							<Button
+								variant="ghost"
+								size="sm"
+								disabled={offset === 0 || isLoading}
+								onClick={() => setOffset(Math.max(offset - limit, 0))}
+								aria-label={t("list.previousPage")}
+							>
+								<ChevronLeft className="h-4 w-4" />
+							</Button>
+						</Tooltip>
+						<Tooltip label={t("list.nextPage")}>
+							<Button
+								variant="ghost"
+								size="sm"
+								disabled={offset + messages.length >= total || isLoading}
+								onClick={() => setOffset(offset + limit)}
+								aria-label={t("list.nextPage")}
+							>
+								<ChevronRight className="h-4 w-4" />
+							</Button>
+						</Tooltip>
+						{config.folder === "inbox" && (
+							<Tooltip label={unreadOnly ? t("list.showingUnread") : t("list.showUnreadOnly")}>
+								<Button
+									type="button"
+									variant="ghost"
+									size="sm"
+									aria-label={t("list.showUnreadOnly")}
+									aria-pressed={unreadOnly}
+									onClick={() => setUnreadOnly((current) => !current)}
+									className={unreadOnly ? "bg-blue-100 text-blue-700 hover:bg-blue-100" : undefined}
+								>
+									<ListFilter className="h-4 w-4" />
+								</Button>
+							</Tooltip>
+						)}
+						{permanentDeleteFolder && (
+							<Tooltip label={getEmptyFolderLabel(permanentDeleteFolder, t)}>
+								<Button
+									type="button"
+									variant="ghost"
+									size="sm"
+									aria-label={getEmptyFolderLabel(permanentDeleteFolder, t)}
+									disabled={emptyingFolder || isLoading || total === 0}
+									onClick={() => void emptyFolder()}
+									className="gap-1.5 text-xs font-medium text-red-600 hover:text-red-700"
+								>
+									<Trash2 className="h-4 w-4" />
+									{!compact && <span className="max-md:hidden">{emptyingFolder ? t("list.emptying") : getEmptyFolderLabel(permanentDeleteFolder, t)}</span>}
+								</Button>
+							</Tooltip>
+						)}
+						{!compact && headerIcons.map((Icon, index) => (
+							<Icon key={index} className="h-4 w-4" />
+						))}
+					</div>
+				)}
+			</div>
+
+			{actionError && (
+				<p role="alert" className="shrink-0 border-b border-red-100 bg-red-50 px-6 py-2 text-sm font-medium text-red-700">
+					{actionError}
+				</p>
+			)}
+
+			<div className="min-h-0 flex-1 overflow-y-auto overscroll-contain scrollbar-gutter-stable">
+				{config.folder === "inbox" && !config.folderId && offset === 0 && !mailboxesLoading && <DueFollowUps mailboxId={selectedMailbox?.id} />}
+				<div role="list" aria-label={title} className="divide-y divide-neutral-100">
+					{messages.map((message) => (
+						<MessageListRow
+							key={message.id}
+							message={message}
+							config={config}
+							selected={selectedIdSet.has(message.id)}
+							active={message.id === selectedMessageId}
+							opening={message.id === visibleOpeningMessageId}
+							onOpening={markMessageOpening}
+							compact={compact || isMobile}
+							currentAccountName={currentAccountName}
+							onSelectedChange={updateSelectedMessage}
+							onMessageAction={handleMessageAction}
+							onSnoozeChange={handleSnoozeChange}
+							showCompactRowActions={compactRowActions}
+							dragMessageIds={selectedIdSet.has(message.id) ? selectedDragIds : undefined}
+							todayKey={todayKey}
+							promotionMode={getPromotionMode(message)}
+							canMovePromotions={canMovePromotions(message)}
+						/>
+					))}
+				</div>
+				{!isLoading && messages.length === 0 && promotionsOff && (
+					<p className="px-6 py-4 text-sm text-neutral-500">
+						{t("folder.empty.promotionsOff")}{" "}
+						<Link href="/settings/inbox" className="font-medium text-blue-700 underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600">
+							{t("folder.empty.promotionsOffLink")}
+						</Link>
+					</p>
+				)}
+				{!isLoading && messages.length === 0 && !promotionsOff && (
+					<p className="px-6 py-4 text-sm text-neutral-500">
+						{hasActiveFilters ? t("list.noMatch") : config.emptyTextKey ? t(config.emptyTextKey) : config.emptyText}
+					</p>
+				)}
+			</div>
+		</div>
+	);
+}
